@@ -15,6 +15,7 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    UpdateCredentialRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -255,6 +256,23 @@ impl AdminService {
             credential_id,
             email,
         })
+    }
+
+    /// 更新凭据的可编辑字段（email、proxy 等）
+    pub fn update_credential(
+        &self,
+        id: u64,
+        req: UpdateCredentialRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_credential(
+                id,
+                req.email.map(|v| if v.is_empty() { None } else { Some(v) }),
+                req.proxy_url.map(|v| if v.is_empty() { None } else { Some(v) }),
+                req.proxy_username.map(|v| if v.is_empty() { None } else { Some(v) }),
+                req.proxy_password.map(|v| if v.is_empty() { None } else { Some(v) }),
+            )
+            .map_err(|e| self.classify_error(e, id))
     }
 
     /// 删除凭据

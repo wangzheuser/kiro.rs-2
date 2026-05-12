@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Pencil } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -23,6 +23,7 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
+import { EditCredentialDialog } from '@/components/edit-credential-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -31,6 +32,16 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+}
+
+// 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
+function maskProxyUrl(url: string): string {
+  const match = url.match(/^(\w+:\/\/)([^:@]+):([^@]+)@(.+)$/)
+  if (!match) return url
+  const [, scheme, user, pass, host] = match
+  const maskPart = (s: string) =>
+    s.length <= 6 ? '****' : `${s.slice(0, 3)}****${s.slice(-3)}`
+  return `${scheme}${maskPart(user)}:${maskPart(pass)}@${host}`
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -60,6 +71,7 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showEditDialog, setShowEditDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -284,7 +296,7 @@ export function CredentialCard({
             {credential.hasProxy && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
+                <span className="font-medium font-mono text-xs">{maskProxyUrl(credential.proxyUrl ?? '')}</span>
               </div>
             )}
             {credential.hasProfileArn && (
@@ -353,6 +365,14 @@ export function CredentialCard({
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={() => setShowEditDialog(true)}
+            >
+              <Pencil className="h-4 w-4 mr-1" />
+              编辑
+            </Button>
+            <Button
+              size="sm"
               variant="default"
               onClick={() => onViewBalance(credential.id)}
             >
@@ -400,6 +420,13 @@ export function CredentialCard({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 编辑凭据对话框 */}
+      <EditCredentialDialog
+        open={showEditDialog}
+        onOpenChange={setShowEditDialog}
+        credential={credential}
+      />
     </>
   )
 }

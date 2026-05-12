@@ -78,6 +78,7 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  email?: string
 }
 
 // 添加凭据响应
@@ -86,4 +87,12 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+// 更新凭据请求（字段为 undefined 表示不修改，空字符串表示清除）
+export interface UpdateCredentialRequest {
+  email?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
 }

@@ -1767,6 +1767,42 @@ impl MultiTokenManager {
         Ok(new_id)
     }
 
+    /// 更新凭据的可编辑字段（Admin API）
+    ///
+    /// 支持更新 email、proxy_url、proxy_username、proxy_password。
+    /// 传 `None` 表示不修改该字段，传 `Some("")` 表示清除该字段。
+    pub fn update_credential(
+        &self,
+        id: u64,
+        email: Option<Option<String>>,
+        proxy_url: Option<Option<String>>,
+        proxy_username: Option<Option<String>>,
+        proxy_password: Option<Option<String>>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if let Some(v) = email {
+                entry.credentials.email = v.filter(|s| !s.is_empty());
+            }
+            if let Some(v) = proxy_url {
+                entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
+            }
+            if let Some(v) = proxy_username {
+                entry.credentials.proxy_username = v.filter(|s| !s.is_empty());
+            }
+            if let Some(v) = proxy_password {
+                entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 删除凭据（Admin API）
     ///
     /// # 前置条件

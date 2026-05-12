@@ -143,6 +143,20 @@ fn default_auth_method() -> String {
     "social".to_string()
 }
 
+/// 更新凭据请求（仅可编辑字段，None 表示不修改，Some("") 表示清除）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialRequest {
+    /// 用户邮箱（用于前端显示）
+    pub email: Option<String>,
+    /// 凭据级代理 URL（空字符串表示清除）
+    pub proxy_url: Option<String>,
+    /// 凭据级代理认证用户名
+    pub proxy_username: Option<String>,
+    /// 凭据级代理认证密码
+    pub proxy_password: Option<String>,
+}
+
 /// 添加凭据成功响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
