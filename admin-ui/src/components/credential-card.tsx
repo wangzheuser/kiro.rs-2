@@ -229,6 +229,7 @@ export function CredentialCard({
   return (
     <>
       <Card
+        data-credential-id={credential.id}
         className={`group hover:-translate-y-0.5 hover:shadow-apple-lg ${
           credential.isCurrent ? 'ring-2 ring-primary/60 shadow-apple-lg' : ''
         } ${
@@ -244,11 +245,20 @@ export function CredentialCard({
       >
         <CardHeader className="pb-3">
           <div className="flex items-start gap-3">
-            <Checkbox
-              className="mt-1 flex-shrink-0"
-              checked={selected}
-              onCheckedChange={onToggleSelect}
-            />
+            <label
+              data-no-rect-select
+              className="mt-0.5 flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
+              onClick={(e) => {
+                // label + Checkbox 双击事件去重，避免触发两次 onCheckedChange
+                e.stopPropagation()
+              }}
+            >
+              <Checkbox
+                className="h-5 w-5 [&_svg]:h-4 [&_svg]:w-4"
+                checked={selected}
+                onCheckedChange={onToggleSelect}
+              />
+            </label>
             <div className="flex-1 min-w-0">
               <CardTitle className="truncate text-[15px]">
                 {credential.email || `凭据 #${credential.id}`}
@@ -370,15 +380,21 @@ export function CredentialCard({
               <div className="space-y-3">
                 <div className="flex items-end justify-between gap-3">
                   <div className="min-w-0">
-                    <div className="text-[11px] uppercase tracking-wider text-muted-foreground">余额</div>
+                    <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
+                      {balance.remaining < 0 ? '超额' : '余额'}
+                    </div>
                     <div
                       className={`mt-0.5 text-xl font-semibold tabular-nums ${
-                        balance.remaining <= 0
+                        balance.remaining < 0
+                          ? 'text-red-600 dark:text-red-400'
+                          : balance.remaining === 0
                           ? 'text-amber-600 dark:text-amber-400'
                           : 'text-emerald-600 dark:text-emerald-400'
                       }`}
                     >
-                      ${formatNumber(balance.remaining)}
+                      {balance.remaining < 0
+                        ? `-$${formatNumber(Math.abs(balance.remaining))}`
+                        : `$${formatNumber(balance.remaining)}`}
                     </div>
                   </div>
                   <div className="text-right min-w-0">

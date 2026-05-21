@@ -26,6 +26,16 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
     return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
 
+  // 超额时 remaining 为负、usagePercentage > 100，给出带正负号的展示
+  const formatSigned = (num: number) => {
+    const abs = Math.abs(num)
+    const formatted = abs.toLocaleString('zh-CN', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })
+    return num < 0 ? `-$${formatted}` : `$${formatted}`
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
@@ -84,9 +94,19 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             {/* 详细信息 */}
             <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
               <div>
-                <span className="text-muted-foreground">剩余额度：</span>
-                <span className="font-medium text-green-600">
-                  ${formatNumber(balance.remaining)}
+                <span className="text-muted-foreground">
+                  {balance.remaining < 0 ? '已超额：' : '剩余额度：'}
+                </span>
+                <span
+                  className={`font-medium ${
+                    balance.remaining < 0
+                      ? 'text-red-600 dark:text-red-400'
+                      : balance.remaining === 0
+                      ? 'text-amber-600 dark:text-amber-400'
+                      : 'text-green-600'
+                  }`}
+                >
+                  {formatSigned(balance.remaining)}
                 </span>
               </div>
               <div>

@@ -1,8 +1,11 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, lazy, Suspense } from 'react'
 import { storage } from '@/lib/storage'
 import { LoginPage } from '@/components/login-page'
-import { Dashboard } from '@/components/dashboard'
 import { Toaster } from '@/components/ui/sonner'
+
+const Dashboard = lazy(() =>
+  import('@/components/dashboard').then((m) => ({ default: m.Dashboard })),
+)
 
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
@@ -25,7 +28,9 @@ function App() {
   return (
     <>
       {isLoggedIn ? (
-        <Dashboard onLogout={handleLogout} />
+        <Suspense fallback={null}>
+          <Dashboard onLogout={handleLogout} />
+        </Suspense>
       ) : (
         <LoginPage onLogin={handleLogin} />
       )}

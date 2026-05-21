@@ -61,7 +61,10 @@ pub struct RegisterClientRequest {
 pub struct RegisterClientResponse {
     pub client_id: String,
     pub client_secret: String,
+    // 上游字段，仅用于完整反序列化记录；当前流程不依赖具体值
+    #[allow(dead_code)]
     pub client_id_issued_at: Option<i64>,
+    #[allow(dead_code)]
     pub client_secret_expires_at: Option<i64>,
 }
 
@@ -112,6 +115,8 @@ pub struct CreateTokenResponse {
 #[derive(Debug, Deserialize)]
 pub struct OidcErrorResponse {
     pub error: String,
+    // 详细描述供日志使用，反序列化时保留以便排错
+    #[allow(dead_code)]
     #[serde(default)]
     pub error_description: Option<String>,
 }

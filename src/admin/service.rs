@@ -1,12 +1,11 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -26,12 +25,18 @@ use super::types::{
     EnableOverageAllResult, ImageUpdateResponse, LoadBalancingModeResponse, PollIdcLoginResponse,
     ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetLoadBalancingModeRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
-    StartSocialLoginResponse, UpdateConfigResponse, UpdateCredentialRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// 在线检查更新结果缓存时间（秒），30 分钟。
+/// 在线检查更新结果缓存时间（秒），30 分钟。
+/// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
+/// 看到红点提醒，又能避免短时间内重复请求被限流。
+const UPDATE_CHECK_TTL_SECS: i64 = 1800;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,34 +47,39 @@ struct CachedBalance {
     data: BalanceResponse,
 }
 
+/// 缓存的"检查更新"结果
+#[derive(Debug, Clone)]
+struct CachedUpdateCheck {
+    /// 缓存时间
+    cached_at: DateTime<Utc>,
+    /// 拉取到的更新信息
+    info: UpdateCheckInfo,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeUpdateConfig {
     image: String,
-    compose_file: Option<String>,
-    service: String,
-    github_token: Option<String>,
+    previous_image: Option<String>,
+    auto_apply: bool,
+    auto_apply_time: String,
 }
 
 impl RuntimeUpdateConfig {
     fn from_config(config: &Config) -> Self {
         Self {
             image: config.update_image.clone(),
-            compose_file: config.update_compose_file.clone(),
-            service: config.update_service.clone(),
-            github_token: config.github_token.clone(),
+            previous_image: config.update_previous_image.clone(),
+            auto_apply: config.update_auto_apply,
+            auto_apply_time: config.update_auto_apply_time.clone(),
         }
     }
 
     fn response(&self) -> UpdateConfigResponse {
         UpdateConfigResponse {
             image: self.image.clone(),
-            compose_file: self.compose_file.clone(),
-            service: self.service.clone(),
-            github_token_configured: self
-                .github_token
-                .as_deref()
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false),
+            previous_image: self.previous_image.clone(),
+            auto_apply: self.auto_apply,
+            auto_apply_time: self.auto_apply_time.clone(),
         }
     }
 }
@@ -87,6 +97,8 @@ pub struct AdminService {
     proxy_pool: ProxyPoolManager,
     /// 在线镜像更新运行时配置
     update_config: Mutex<RuntimeUpdateConfig>,
+    /// 最近一次"检查更新"结果（带 TTL，用于减少 GitHub API 调用）
+    update_check_cache: Mutex<Option<CachedUpdateCheck>>,
     /// 进行中的 IdC 设备授权会话
     idc_sessions: Arc<Mutex<HashMap<String, IdcAuthSession>>>,
     /// 进行中的 Social 登录会话
@@ -127,6 +139,45 @@ struct IdcAuthSession {
     relogin_target_id: Option<u64>,
 }
 
+/// 解析自动更新触发时间（`HH:MM`，本地 24 小时制）。允许 `H:M` 简写，
+/// 例如 `3:0`；解析失败时返回原字符串，便于错误信息提示。
+fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AdminServiceError::InvalidCredential(
+            "自动更新时间不能为空".to_string(),
+        ));
+    }
+    let mut parts = trimmed.splitn(2, ':');
+    let hour_str = parts.next().unwrap_or("");
+    let minute_str = parts.next().unwrap_or("");
+    let hour: u32 = hour_str.parse().map_err(|_| {
+        AdminServiceError::InvalidCredential(format!(
+            "自动更新时间格式无效：{}（应为 HH:MM）",
+            value
+        ))
+    })?;
+    let minute: u32 = minute_str.parse().map_err(|_| {
+        AdminServiceError::InvalidCredential(format!(
+            "自动更新时间格式无效：{}（应为 HH:MM）",
+            value
+        ))
+    })?;
+    if hour > 23 || minute > 59 {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "自动更新时间超出范围：{}（HH 0-23，MM 0-59）",
+            value
+        )));
+    }
+    Ok((hour, minute))
+}
+
+/// 把 HH:MM 规范化成 `HH:MM`（两位补零），方便存储和比较。
+fn normalize_auto_apply_time(value: &str) -> Result<String, AdminServiceError> {
+    let (h, m) = parse_auto_apply_time(value)?;
+    Ok(format!("{:02}:{:02}", h, m))
+}
+
 fn validate_image_ref(image: &str) -> Result<(), AdminServiceError> {
     let value = image.trim();
     if value.is_empty() {
@@ -134,59 +185,317 @@ fn validate_image_ref(image: &str) -> Result<(), AdminServiceError> {
             "镜像地址不能为空".to_string(),
         ));
     }
-    if !value.starts_with("ghcr.io/") {
-        return Err(AdminServiceError::InvalidCredential(
-            "在线更新只支持 GitHub Container Registry 镜像（ghcr.io/...）".to_string(),
-        ));
-    }
     if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(AdminServiceError::InvalidCredential(
             "镜像地址不能包含空白或控制字符".to_string(),
         ));
     }
-    let path_parts: Vec<&str> = value.trim_start_matches("ghcr.io/").split('/').collect();
+    // 仅允许 Docker Hub 镜像：可以省略 host（如 `zyphrzero/kiro-rs:latest`），
+    // 也可以显式写 `docker.io/...` 或 `registry-1.docker.io/...`。
+    let allowed_prefixes = ["docker.io/", "registry-1.docker.io/"];
+    let host_segment = value.split('/').next().unwrap_or("");
+    let looks_like_dockerhub = !host_segment.contains('.') && !host_segment.contains(':');
+    if !allowed_prefixes.iter().any(|p| value.starts_with(p)) && !looks_like_dockerhub {
+        return Err(AdminServiceError::InvalidCredential(
+            "在线更新只支持 Docker Hub 镜像（如 owner/image:tag 或 docker.io/owner/image:tag）"
+                .to_string(),
+        ));
+    }
+    let path_parts: Vec<&str> = value
+        .trim_start_matches("docker.io/")
+        .trim_start_matches("registry-1.docker.io/")
+        .split('/')
+        .collect();
     if path_parts.len() < 2 || path_parts.iter().any(|part| part.is_empty()) {
         return Err(AdminServiceError::InvalidCredential(
-            "镜像地址需使用 ghcr.io/owner/image:tag 格式".to_string(),
+            "Docker Hub 镜像需为 owner/image[:tag] 格式".to_string(),
         ));
     }
     Ok(())
 }
 
-fn validate_compose_file(path: &str) -> Result<(), AdminServiceError> {
-    if path.chars().any(|c| c == '\0' || c == '\r' || c == '\n') {
-        return Err(AdminServiceError::InvalidCredential(
-            "compose 文件路径不能包含换行或 NUL 字符".to_string(),
-        ));
-    }
-    Ok(())
+/// Docker Hub Hub API（`hub.docker.com/v2/repositories/<owner>/<repo>/tags`）
+/// 返回 JSON 中我们关心的字段。仅依赖该接口的稳定字段，新增字段不影响解析。
+#[derive(Debug, Deserialize)]
+struct DockerHubTagsResponse {
+    #[serde(default)]
+    results: Vec<DockerHubTag>,
 }
 
-fn validate_compose_service(service: &str) -> Result<(), AdminServiceError> {
-    let value = service.trim();
-    if value.is_empty() {
-        return Err(AdminServiceError::InvalidCredential(
-            "compose service 名称不能为空".to_string(),
-        ));
-    }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        return Err(AdminServiceError::InvalidCredential(
-            "compose service 名称只能包含字母、数字、_、-、.".to_string(),
-        ));
-    }
-    Ok(())
+#[derive(Debug, Deserialize)]
+struct DockerHubTag {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    last_updated: String,
 }
 
-fn ghcr_login_user(image: &str) -> &str {
-    image
-        .trim_start_matches("ghcr.io/")
-        .split('/')
+/// GitHub `repos/{owner}/{repo}/releases/tags/{tag}` 返回 JSON 中我们关心
+/// 的字段，用于在「检查更新」结果里附带本次发布的 changelog。
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    published_at: String,
+}
+
+/// 把镜像引用拆成 `(owner, repo)`；忽略可选的 `:tag` 与 `docker.io/` 前缀。
+///
+/// 例如：
+/// - `zyphrzero/kiro-rs:latest` → `("zyphrzero", "kiro-rs")`
+/// - `docker.io/library/redis` → `("library", "redis")`
+fn dockerhub_owner_repo(image: &str) -> Option<(String, String)> {
+    let trimmed = image
+        .trim()
+        .trim_start_matches("docker.io/")
+        .trim_start_matches("registry-1.docker.io/")
+        .split('@') // 去除 @sha256:... 摘要
+        .next()?
+        .split(':') // 去除 :tag
+        .next()?;
+    let mut parts = trimmed.split('/');
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.to_string();
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((owner, repo))
+}
+
+/// 比较两个 semver 字符串。仅按 `MAJOR.MINOR.PATCH` 三段数字比较，忽略
+/// 预发布后缀；解析失败的段当作 0 处理（最坏情况下"无更新"）。
+fn compare_semver(current: &str, latest: &str) -> std::cmp::Ordering {
+    parse_semver_core(current).cmp(&parse_semver_core(latest))
+}
+
+/// 解析 semver 三段数字，解析失败的段作 0；用于 latest tag 的稳定排序。
+fn parse_semver_core(value: &str) -> [u32; 3] {
+    let core = value
+        .trim_start_matches('v')
+        .split(|c: char| c == '-' || c == '+')
         .next()
+        .unwrap_or("");
+    let mut out = [0u32; 3];
+    for (i, part) in core.splitn(3, '.').enumerate() {
+        if i >= 3 {
+            break;
+        }
+        out[i] = part.parse::<u32>().unwrap_or(0);
+    }
+    out
+}
+
+/// 判断字符串是否是合法的 semver-like tag（必须以数字 `MAJOR.MINOR.PATCH` 开头）。
+/// 这样 `latest` / `rolling` / `dev` 等非版本 tag 会被自动排除。
+fn is_semver_tag(value: &str) -> bool {
+    let core = value.trim().trim_start_matches('v');
+    let mut parts = core.split(|c: char| c == '-' || c == '+').next().unwrap_or("").split('.');
+    let first = parts.next().unwrap_or("");
+    !first.is_empty() && first.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 当前构建类型。docker 镜像里通过 `apply_image_update` 调 compose 重建，
+/// 因此固定为 "docker-compose"；非容器场景的二进制升级路径暂未实现。
+const BUILD_TYPE: &str = "docker-compose";
+
+/// GitHub Release 仓库名（owner/repo）。
+/// 镜像版本号从 Docker Hub 取，但 release notes / changelog 由 GitHub Release
+/// 维护，需要单独拉取。
+const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
+
+/// 容器名 / hostname：在线更新执行流程会用容器自身的 compose 标签来发现 compose 文件位置和 service 名。
+const SELF_CONTAINER_HOSTNAME_ENV: &str = "HOSTNAME";
+
+/// 默认的容器内 compose 文件挂载位置，由仓库 docker-compose.yml 直接挂载得到。
+const DEFAULT_IN_CONTAINER_COMPOSE_PATH: &str = "/app/config/docker-compose.yml";
+
+/// 用于回退的本地镜像 tag。每次成功更新前，都会把当前运行镜像打到这个 tag 上，
+/// 这样即使远端 latest 已被覆盖，本地仍保留一份可用的旧镜像。
+const ROLLBACK_IMAGE_TAG: &str = "kiro-rs:rollback";
+
+/// 通过 `docker inspect <hostname> --format <fmt>` 读取当前容器的某项元数据。
+fn inspect_self_container(format: &str) -> Result<String, AdminServiceError> {
+    let hostname = std::env::var(SELF_CONTAINER_HOSTNAME_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or("github")
+        .ok_or_else(|| {
+            AdminServiceError::InternalError(
+                "无法获取当前容器 hostname（HOSTNAME 环境变量为空）".to_string(),
+            )
+        })?;
+
+    let raw = run_command("docker", &["inspect", "--format", format, &hostname]).map_err(|e| {
+        AdminServiceError::InternalError(format!(
+            "通过 docker inspect 读取容器信息失败：{}。请确认容器内已安装 docker CLI 并挂载 /var/run/docker.sock。",
+            e
+        ))
+    })?;
+
+    Ok(raw.lines().next().unwrap_or("").trim().to_string())
+}
+
+/// 通过 docker CLI 读取当前容器的 compose 元数据（compose 文件路径 + service 名）。
+///
+/// 容器需要满足两个前置条件，才能在容器内自动完成在线更新：
+/// 1. 已挂载 `/var/run/docker.sock`，使 `docker` 命令能访问宿主机 daemon。
+/// 2. 容器是由 `docker compose` 启动的（compose 会自动在容器上写入
+///    `com.docker.compose.project.config_files` 与 `com.docker.compose.service` 标签）。
+///
+/// 返回的 compose 文件路径来源是宿主机视角；调用方需要再用
+/// [`resolve_in_container_compose_path`] 将其映射为容器内能读到的路径。
+fn detect_compose_metadata() -> Result<(String, String), AdminServiceError> {
+    let raw = inspect_self_container(
+        "{{index .Config.Labels \"com.docker.compose.project.config_files\"}}|{{index .Config.Labels \"com.docker.compose.service\"}}",
+    )?;
+
+    let mut parts = raw.splitn(2, '|');
+    let compose_file = parts.next().unwrap_or("").trim().to_string();
+    let service = parts.next().unwrap_or("").trim().to_string();
+
+    if service.is_empty() {
+        return Err(AdminServiceError::InternalError(
+            "当前容器缺少 docker compose service 标签，无法自动识别。请使用 `docker compose -f docker-compose.yml up -d` 启动容器后再尝试在线更新。".to_string(),
+        ));
+    }
+
+    Ok((compose_file, service))
+}
+
+/// 读取当前容器正在运行的镜像引用与镜像 ID。
+///
+/// 返回 (`image_ref`, `image_id`)。`image_ref` 是 `.Config.Image`，可能是 tag
+/// 或 sha256；`image_id` 是 `.Image`，固定为 sha256 摘要，备份打 tag 时用它。
+fn detect_running_image() -> Result<(String, String), AdminServiceError> {
+    let image_ref = inspect_self_container("{{.Config.Image}}")?;
+    let image_id = inspect_self_container("{{.Image}}")?;
+    if image_id.is_empty() {
+        return Err(AdminServiceError::InternalError(
+            "无法读取当前容器的镜像 ID".to_string(),
+        ));
+    }
+    Ok((image_ref, image_id))
+}
+
+/// 给镜像 ID 打 `kiro-rs:rollback` tag，作为回退镜像。
+fn tag_rollback_image(image_id: &str) -> Result<String, AdminServiceError> {
+    run_command("docker", &["tag", image_id, ROLLBACK_IMAGE_TAG])
+}
+
+/// 检查本地是否还存在 `kiro-rs:rollback` 镜像。
+fn rollback_image_present() -> bool {
+    run_command("docker", &["image", "inspect", ROLLBACK_IMAGE_TAG]).is_ok()
+}
+
+/// 一次更新流程中重复使用的 compose 上下文：宿主机 project dir、容器内 yml 路径、
+/// 服务名。聚合到一起避免每次都重新 detect。
+struct ComposeContext {
+    host_project_dir: String,
+    in_container_compose: String,
+    service: String,
+}
+
+impl ComposeContext {
+    fn detect() -> Result<Self, AdminServiceError> {
+        let (host_compose_file, service) = detect_compose_metadata()?;
+        let in_container_compose = resolve_in_container_compose_path(&host_compose_file)?;
+        ensure_compose_file_exists(&in_container_compose)?;
+        let host_project_dir = std::path::Path::new(&host_compose_file)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| ".".to_string());
+        Ok(Self {
+            host_project_dir,
+            in_container_compose,
+            service,
+        })
+    }
+
+    fn compose_pull(&self, image: &str) -> Result<String, AdminServiceError> {
+        let env = [("KIRO_RS_IMAGE", image)];
+        run_command_with_env(
+            "docker",
+            &[
+                "compose",
+                "--project-directory",
+                self.host_project_dir.as_str(),
+                "-f",
+                self.in_container_compose.as_str(),
+                "pull",
+                self.service.as_str(),
+            ],
+            &env,
+        )
+    }
+
+    fn compose_up(&self, image: &str) -> Result<String, AdminServiceError> {
+        let env = [("KIRO_RS_IMAGE", image)];
+        run_command_with_env(
+            "docker",
+            &[
+                "compose",
+                "--project-directory",
+                self.host_project_dir.as_str(),
+                "-f",
+                self.in_container_compose.as_str(),
+                "up",
+                "-d",
+                self.service.as_str(),
+            ],
+            &env,
+        )
+    }
+}
+
+/// 把 docker compose 标签里的宿主机路径映射成容器内可读的路径。
+///
+/// 容器内运行 `docker compose -f <path>` 时，CLI 会在本地（容器内）解析 yml，
+/// 因此必须挂载好 yml 文件。仓库默认 docker-compose.yml 已经挂载到
+/// `/app/config/docker-compose.yml`，这里以该路径作为兜底。
+fn resolve_in_container_compose_path(host_path: &str) -> Result<String, AdminServiceError> {
+    let host_trim = host_path.trim();
+    if !host_trim.is_empty() && std::path::Path::new(host_trim).is_file() {
+        return Ok(host_trim.to_string());
+    }
+    if std::path::Path::new(DEFAULT_IN_CONTAINER_COMPOSE_PATH).is_file() {
+        return Ok(DEFAULT_IN_CONTAINER_COMPOSE_PATH.to_string());
+    }
+    Err(AdminServiceError::InternalError(format!(
+        "compose 文件在容器内不可读。docker compose 标签指向宿主机路径 {host_trim:?}，且默认挂载点 {DEFAULT_IN_CONTAINER_COMPOSE_PATH} 也不存在。请在 docker-compose.yml 中保留 `./docker-compose.yml:{DEFAULT_IN_CONTAINER_COMPOSE_PATH}:ro` 这条挂载，并确认宿主机当前目录下有 docker-compose.yml 文件。"
+    )))
+}
+
+/// 在执行 compose 前，确保 compose 文件实际存在且是普通文件。
+///
+/// 这里专门处理 Docker bind mount 的常见陷阱：当宿主机源文件不存在时，
+/// Docker 会把目标路径自动创建成空目录，导致 `docker compose -f <path>` 报
+/// `read <path>: is a directory`。提前给出可操作的提示比让命令失败更友好。
+fn ensure_compose_file_exists(path: &str) -> Result<(), AdminServiceError> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        AdminServiceError::InternalError(format!(
+            "compose 文件 {} 不可访问: {}。请确认宿主机上该文件存在并已挂载到容器内的同一路径。",
+            path, e
+        ))
+    })?;
+    if metadata.is_dir() {
+        return Err(AdminServiceError::InternalError(format!(
+            "compose 文件 {} 实际是一个目录。常见原因是 docker-compose.yml 在宿主机上不存在，被 Docker 自动创建为空目录。请在宿主机上提供真实的 docker-compose.yml 后重新启动容器。",
+            path
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(AdminServiceError::InternalError(format!(
+            "compose 文件 {} 不是普通文件，无法用于 docker compose -f",
+            path
+        )));
+    }
+    Ok(())
 }
 
 fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {
@@ -235,39 +544,6 @@ fn run_command(program: &str, args: &[&str]) -> Result<String, AdminServiceError
     run_command_with_env(program, args, &[])
 }
 
-fn run_docker_login(image: &str, token: &str) -> Result<String, AdminServiceError> {
-    let user = ghcr_login_user(image);
-    let mut child = Command::new("docker")
-        .args(["login", "ghcr.io", "-u", user, "--password-stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| AdminServiceError::InternalError(format!("执行 docker login 失败: {}", e)))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(token.as_bytes()).map_err(|e| {
-            AdminServiceError::InternalError(format!(
-                "写入 GitHub Token 到 docker login 失败: {}",
-                e
-            ))
-        })?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| AdminServiceError::InternalError(format!("等待 docker login 失败: {}", e)))?;
-    let text = command_output_text(&output.stdout, &output.stderr);
-    if !output.status.success() {
-        return Err(AdminServiceError::InternalError(format!(
-            "docker login ghcr.io 失败（{}）: {}",
-            output.status,
-            text.trim()
-        )));
-    }
-    Ok(text)
-}
-
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
@@ -289,6 +565,7 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool: ProxyPoolManager::new(proxy_pool_path),
             update_config: Mutex::new(update_config),
+            update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -504,9 +781,12 @@ impl AdminService {
 
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
+        // 允许 remaining 显示为负值：开启超额后实际使用可能超过限额，
+        // 直接保留差值便于在 UI 中体现"已欠多少"。
+        let remaining = usage_limit - current_usage;
+        // usage_percentage 同理保留真实值，超额时 > 100%。
         let usage_percentage = if usage_limit > 0.0 {
-            (current_usage / usage_limit * 100.0).min(100.0)
+            current_usage / usage_limit * 100.0
         } else {
             0.0
         };
@@ -590,6 +870,84 @@ impl AdminService {
                     started.elapsed().as_secs_f32()
                 );
                 tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    /// 启动无人值守自动更新调度器。
+    ///
+    /// 任务始终运行，每分钟唤醒一次：
+    /// - `update_auto_apply` 关闭时只是记录"未到点"，不做任何远端调用。
+    /// - 开启时，比较当前本地时间与 `update_auto_apply_time`，命中目标分钟
+    ///   就触发一次 `apply_image_update`。同一目标版本只会被自动应用一次。
+    pub fn start_auto_update_scheduler(self: &Arc<Self>) {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            // 给 Docker socket / compose 元数据探测留点准备时间
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            // 同一分钟避免重复触发；记录最近一次应用过的"日期 + 版本"
+            let mut last_run_marker: Option<String> = None;
+            let mut last_applied_version: Option<String> = None;
+
+            loop {
+                let runtime = svc.update_config.lock().clone();
+                if runtime.auto_apply {
+                    let target = parse_auto_apply_time(&runtime.auto_apply_time).ok();
+                    if let Some((target_hour, target_minute)) = target {
+                        let now = chrono::Local::now();
+                        let date_minute_marker = format!(
+                            "{}-{:02}:{:02}",
+                            now.format("%Y-%m-%d"),
+                            now.hour(),
+                            now.minute()
+                        );
+
+                        let hit = now.hour() == target_hour && now.minute() == target_minute;
+                        let already_ran_this_minute = last_run_marker.as_deref()
+                            == Some(date_minute_marker.as_str());
+
+                        if hit && !already_ran_this_minute {
+                            last_run_marker = Some(date_minute_marker);
+                            let info = svc.check_update(true).await;
+                            if info.has_update
+                                && !info.latest_version.is_empty()
+                                && last_applied_version.as_deref()
+                                    != Some(info.latest_version.as_str())
+                            {
+                                tracing::info!(
+                                    "自动更新：到达计划时间 {}，发现新版本 {}（当前 {}），开始应用",
+                                    runtime.auto_apply_time,
+                                    info.latest_version,
+                                    info.current_version
+                                );
+                                match svc.apply_image_update() {
+                                    Ok(res) => {
+                                        tracing::info!("自动更新完成：{}", res.message);
+                                        last_applied_version = Some(info.latest_version);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("自动更新失败：{}", e);
+                                    }
+                                }
+                            } else {
+                                tracing::info!(
+                                    "自动更新：到达计划时间 {}，但当前已是最新版本（{}）",
+                                    runtime.auto_apply_time,
+                                    info.current_version
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "自动更新时间配置无效：{}，跳过本轮检查",
+                            runtime.auto_apply_time
+                        );
+                    }
+                }
+
+                // 30 秒粒度足以可靠命中目标分钟，又不会在系统时间漂移下错过
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
         });
     }
@@ -760,42 +1118,34 @@ impl AdminService {
         self.update_config.lock().response()
     }
 
-    /// 更新在线更新配置。github_token 为空字符串时保留现有 token。
+    /// 更新在线更新配置。
     pub fn set_update_config(
         &self,
         req: SetUpdateConfigRequest,
     ) -> Result<UpdateConfigResponse, AdminServiceError> {
         if let Some(image) = &req.image {
-            validate_image_ref(image)?;
+            let trimmed = image.trim();
+            if !trimmed.is_empty() {
+                validate_image_ref(trimmed)?;
+            }
         }
-        if let Some(service) = &req.service {
-            validate_compose_service(service)?;
-        }
-        if let Some(compose_file) = &req.compose_file {
-            validate_compose_file(compose_file)?;
-        }
+
+        // 在写入运行时之前先校验时间格式，并规范化成两位补零的 HH:MM
+        let normalized_time = match req.auto_apply_time.as_deref() {
+            Some(value) => Some(normalize_auto_apply_time(value)?),
+            None => None,
+        };
 
         {
             let mut runtime = self.update_config.lock();
             if let Some(image) = &req.image {
                 runtime.image = image.trim().to_string();
             }
-            if let Some(compose_file) = &req.compose_file {
-                let trimmed = compose_file.trim();
-                runtime.compose_file = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
+            if let Some(auto_apply) = req.auto_apply {
+                runtime.auto_apply = auto_apply;
             }
-            if let Some(service) = &req.service {
-                runtime.service = service.trim().to_string();
-            }
-            if let Some(token) = &req.github_token {
-                let trimmed = token.trim();
-                if !trimmed.is_empty() {
-                    runtime.github_token = Some(trimmed.to_string());
-                }
+            if let Some(time) = &normalized_time {
+                runtime.auto_apply_time = time.clone();
             }
         }
 
@@ -803,45 +1153,24 @@ impl AdminService {
             if let Some(image) = req.image {
                 c.update_image = image.trim().to_string();
             }
-            if let Some(compose_file) = req.compose_file {
-                let trimmed = compose_file.trim();
-                c.update_compose_file = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
+            if let Some(auto_apply) = req.auto_apply {
+                c.update_auto_apply = auto_apply;
             }
-            if let Some(service) = req.service {
-                c.update_service = service.trim().to_string();
-            }
-            if let Some(token) = req.github_token {
-                let trimmed = token.trim();
-                if !trimmed.is_empty() {
-                    c.github_token = Some(trimmed.to_string());
-                }
+            if let Some(time) = normalized_time {
+                c.update_auto_apply_time = time;
             }
         });
 
         Ok(self.get_update_config())
     }
 
-    /// 拉取配置中的 GHCR 镜像。若配置 GitHub Token，会先 docker login ghcr.io。
+    /// 拉取配置中的镜像（公开镜像，直接 docker pull，无需登录）。
     pub fn pull_update_image(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
         let config = self.update_config.lock().clone();
         let image = config.image.trim().to_string();
         validate_image_ref(&image)?;
 
-        let mut output = String::new();
-        if let Some(token) = config
-            .github_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            output.push_str(&run_docker_login(&image, token)?);
-        }
-
-        output.push_str(&run_command("docker", &["pull", &image])?);
+        let output = run_command("docker", &["pull", &image])?;
 
         Ok(ImageUpdateResponse {
             success: true,
@@ -855,49 +1184,49 @@ impl AdminService {
 
     /// 拉取镜像并通过 docker compose 重建服务。
     ///
-    /// 需要运行环境安装 Docker CLI，并能访问 Docker daemon。容器内使用时通常需要挂载
-    /// /var/run/docker.sock 和 docker-compose.yml。
+    /// 容器内调用时需要满足：
+    /// 1. 已挂载 `/var/run/docker.sock`（默认 docker-compose.yml 已挂载）。
+    /// 2. 容器是由 `docker compose` 启动的（compose 自带的标签会写入容器）。
+    /// 3. 容器在宿主机上的 compose 文件仍然存在于 compose 标签所记录的位置。
     pub fn apply_image_update(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
-        let config = self.update_config.lock().clone();
-        let image = config.image.trim().to_string();
+        let image = self.update_config.lock().image.trim().to_string();
         validate_image_ref(&image)?;
 
-        let compose_file = config
-            .compose_file
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                AdminServiceError::InvalidCredential(
-                    "未配置 updateComposeFile，无法在线应用镜像更新".to_string(),
-                )
-            })?;
-
-        let service = config.service.trim();
-        validate_compose_service(service)?;
+        let ctx = ComposeContext::detect()?;
 
         let mut output = String::new();
-        if let Some(token) = config
-            .github_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            output.push_str(&run_docker_login(&image, token)?);
-        }
 
-        output.push_str(&run_command("docker", &["pull", &image])?);
-        let compose_env = [("KIRO_RS_IMAGE", image.as_str())];
-        output.push_str(&run_command_with_env(
-            "docker",
-            &["compose", "-f", compose_file, "pull", service],
-            &compose_env,
-        )?);
-        output.push_str(&run_command_with_env(
-            "docker",
-            &["compose", "-f", compose_file, "up", "-d", service],
-            &compose_env,
-        )?);
+        // 在 pull 新镜像之前，把当前正在运行的镜像打到 `kiro-rs:rollback` 这个
+        // 本地备份 tag 上。即使后续远端 latest 被覆盖、本地原始 tag 被新镜像
+        // 取代，备份镜像也仍然可用，可在断网情况下回退。
+        let previous_image_ref = match detect_running_image() {
+            Ok((image_ref, image_id)) => match tag_rollback_image(&image_id) {
+                Ok(tag_out) => {
+                    output.push_str(&tag_out);
+                    Some(image_ref)
+                }
+                Err(e) => {
+                    output.push_str(&format!("warning: 备份当前镜像失败: {}\n", e));
+                    None
+                }
+            },
+            Err(e) => {
+                output.push_str(&format!("warning: 读取当前镜像信息失败: {}\n", e));
+                None
+            }
+        };
+
+        output.push_str(&ctx.compose_pull(image.as_str())?);
+        output.push_str(&ctx.compose_up(image.as_str())?);
+
+        // 仅当成功应用了新镜像后再持久化 previous_image，避免回退指向并未真正
+        // 切换到的版本。
+        if let Some(prev) = previous_image_ref.clone() {
+            self.update_config.lock().previous_image = Some(prev.clone());
+            self.update_config_file(move |c| {
+                c.update_previous_image = Some(prev);
+            });
+        }
 
         Ok(ImageUpdateResponse {
             success: true,
@@ -907,6 +1236,254 @@ impl AdminService {
             applied: true,
             need_restart: true,
         })
+    }
+
+    /// 把容器回退到上一次更新前的镜像版本。
+    ///
+    /// 回退使用本地备份 tag `kiro-rs:rollback`，不会再访问镜像仓库，因此即使
+    /// 上游 latest 已经被覆盖、网络中断，也能恢复到旧版本。
+    pub fn rollback_image_update(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
+        let runtime = self.update_config.lock().clone();
+        let previous_image = runtime
+            .previous_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "尚未记录可回退的镜像版本，请先执行一次在线更新".to_string(),
+                )
+            })?
+            .to_string();
+
+        if !rollback_image_present() {
+            return Err(AdminServiceError::InternalError(format!(
+                "本地未找到备份镜像 {}，可能已被 docker image prune 清理。无法离线回退。",
+                ROLLBACK_IMAGE_TAG
+            )));
+        }
+
+        let ctx = ComposeContext::detect()?;
+
+        let mut output = String::new();
+        // 直接用本地备份 tag 跑 compose up，不再 pull。
+        output.push_str(&ctx.compose_up(ROLLBACK_IMAGE_TAG)?);
+
+        // 把当前镜像配置同步成回退后的版本，方便用户在 UI 上看清现状。
+        self.update_config.lock().image = previous_image.clone();
+        let to_persist = previous_image.clone();
+        self.update_config_file(move |c| {
+            c.update_image = to_persist;
+        });
+
+        Ok(ImageUpdateResponse {
+            success: true,
+            message: format!("已回退到镜像 {}", previous_image),
+            image: previous_image,
+            output: Some(output),
+            applied: true,
+            need_restart: true,
+        })
+    }
+
+    /// 检查 GitHub Releases 上是否存在新版本。
+    ///
+    /// `force=false` 时优先返回 30 分钟内的缓存结果；`force=true` 时强制查询
+    /// 远端。查询失败但有旧缓存时，返回旧缓存并附带 warning。
+    pub async fn check_update(&self, force: bool) -> UpdateCheckInfo {
+        if !force {
+            if let Some(cached) = self.update_check_cache.lock().clone() {
+                let age = Utc::now()
+                    .signed_duration_since(cached.cached_at)
+                    .num_seconds();
+                if age < UPDATE_CHECK_TTL_SECS {
+                    let mut info = cached.info.clone();
+                    info.cached = true;
+                    return info;
+                }
+            }
+        }
+
+        match self.fetch_latest_release().await {
+            Ok(info) => {
+                self.update_check_cache.lock().replace(CachedUpdateCheck {
+                    cached_at: Utc::now(),
+                    info: info.clone(),
+                });
+                info
+            }
+            Err(err) => {
+                let warning = format!("检查更新失败：{}", err);
+                if let Some(cached) = self.update_check_cache.lock().clone() {
+                    let mut info = cached.info.clone();
+                    info.cached = true;
+                    info.warning = Some(warning);
+                    return info;
+                }
+                UpdateCheckInfo {
+                    current_version: env!("CARGO_PKG_VERSION").to_string(),
+                    latest_version: String::new(),
+                    has_update: false,
+                    build_type: BUILD_TYPE.to_string(),
+                    release_name: None,
+                    release_notes: None,
+                    release_url: None,
+                    published_at: None,
+                    checked_at: Utc::now().to_rfc3339(),
+                    cached: false,
+                    warning: Some(warning),
+                }
+            }
+        }
+    }
+
+    async fn fetch_latest_release(&self) -> Result<UpdateCheckInfo, AdminServiceError> {
+        let configured_image = self.update_config.lock().image.clone();
+        // 用户清空 image 时降级到默认镜像，行为对齐 Config::load 的清洗逻辑
+        let image = if configured_image.trim().is_empty() {
+            "zyphrzero/kiro-rs:latest".to_string()
+        } else {
+            configured_image
+        };
+        let (owner, repo) = dockerhub_owner_repo(image.trim()).ok_or_else(|| {
+            AdminServiceError::InternalError(format!(
+                "无法从镜像 {} 解析出 Docker Hub owner/repo",
+                image
+            ))
+        })?;
+
+        // page_size=100 在我们目标仓库已足够覆盖所有版本 tag；增量发布也不会
+        // 一次性产生上百个版本。`page=1` 即可拿到最新批次。
+        let url = format!(
+            "https://hub.docker.com/v2/repositories/{}/{}/tags?page_size=100&page=1",
+            owner, repo
+        );
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("Accept", "application/json")
+            .header("User-Agent", "kiro-rs-update-checker")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("请求 Docker Hub API 失败: {}", e))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // Docker Hub 仓库不存在或私有时返回 404；这是配置错误而非服务故障，
+            // 给用户更具体的提示，让他们知道该去看 updateImage 配置而不是日志。
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(AdminServiceError::InternalError(format!(
+                    "Docker Hub 上未找到镜像 {}/{}（可能仓库还未发布或为私有）。请确认 updateImage 指向的仓库存在并已公开。",
+                    owner, repo
+                )));
+            }
+            return Err(AdminServiceError::InternalError(format!(
+                "Docker Hub API 返回 {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            )));
+        }
+
+        let payload: DockerHubTagsResponse = resp.json().await.map_err(|e| {
+            AdminServiceError::InternalError(format!("解析 Docker Hub 响应失败: {}", e))
+        })?;
+
+        // 过滤出语义化版本 tag（排除 latest / rolling / dev 之类），按版本号选最大
+        let latest_tag = payload
+            .results
+            .into_iter()
+            .filter(|t| is_semver_tag(&t.name))
+            .max_by(|a, b| parse_semver_core(&a.name).cmp(&parse_semver_core(&b.name)));
+
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        let (latest_version, published_at) = match latest_tag {
+            Some(tag) => (
+                tag.name.trim().trim_start_matches('v').to_string(),
+                Some(tag.last_updated).filter(|v| !v.is_empty()),
+            ),
+            None => (String::new(), None),
+        };
+        let has_update =
+            !latest_version.is_empty() && compare_semver(&current, &latest_version).is_lt();
+
+        let release_url = if !latest_version.is_empty() {
+            Some(format!(
+                "https://hub.docker.com/r/{}/{}/tags",
+                owner, repo
+            ))
+        } else {
+            None
+        };
+
+        // 拉取 GitHub Release 上的 changelog；失败不影响主流程，前端能拿到
+        // 版本号就够展示红点了。published_at 优先用 GitHub Release 给出的，
+        // 因为它是发布动作的时间，比 Docker Hub 推送时间更接近"用户视角的版本时间"。
+        let mut release_name: Option<String> = None;
+        let mut release_notes: Option<String> = None;
+        let mut release_html_url: Option<String> = None;
+        let mut release_published_at: Option<String> = None;
+        if !latest_version.is_empty() {
+            match Self::fetch_github_release(&latest_version).await {
+                Ok(release) => {
+                    release_name = Some(release.name).filter(|v| !v.is_empty());
+                    release_notes = Some(release.body).filter(|v| !v.is_empty());
+                    release_html_url = Some(release.html_url).filter(|v| !v.is_empty());
+                    release_published_at = Some(release.published_at).filter(|v| !v.is_empty());
+                }
+                Err(e) => {
+                    tracing::debug!("获取 GitHub Release 信息失败（不影响检查更新）：{}", e);
+                }
+            }
+        }
+
+        Ok(UpdateCheckInfo {
+            current_version: current,
+            latest_version,
+            has_update,
+            build_type: BUILD_TYPE.to_string(),
+            release_name,
+            release_notes,
+            // 优先用 GitHub Release 页面 URL（带 changelog），回退到 Docker Hub tag 列表
+            release_url: release_html_url.or(release_url),
+            // GitHub published_at 更精确，未拿到就回退到 Docker Hub last_updated
+            published_at: release_published_at.or(published_at),
+            checked_at: Utc::now().to_rfc3339(),
+            cached: false,
+            warning: None,
+        })
+    }
+
+    /// 拉 GitHub Releases 上指定版本的发布信息（用于展示 changelog）。
+    /// 调用方负责处理失败 —— 这条不能阻塞主版本检查流程。
+    async fn fetch_github_release(version: &str) -> Result<GitHubRelease, AdminServiceError> {
+        let tag = format!("v{}", version.trim());
+        let url = format!(
+            "https://api.github.com/repos/{}/releases/tags/{}",
+            GITHUB_RELEASES_REPO, tag
+        );
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "kiro-rs-update-checker")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| AdminServiceError::InternalError(format!("请求 GitHub API 失败: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(AdminServiceError::InternalError(format!(
+                "GitHub API 返回 {}",
+                resp.status()
+            )));
+        }
+
+        resp.json::<GitHubRelease>()
+            .await
+            .map_err(|e| AdminServiceError::InternalError(format!("解析 GitHub release 失败: {}", e)))
     }
 
     /// 获取负载均衡模式
@@ -1924,35 +2501,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_ghcr_image_refs() {
-        assert!(validate_image_ref("ghcr.io/owner/kiro-rs:latest").is_ok());
-        assert!(validate_image_ref(" ghcr.io/owner/nested/kiro-rs:v1 ").is_ok());
+    fn validates_image_refs() {
+        assert!(validate_image_ref("zyphrzero/kiro-rs:latest").is_ok());
+        assert!(validate_image_ref(" docker.io/owner/kiro-rs:v1 ").is_ok());
+        assert!(validate_image_ref("registry-1.docker.io/owner/kiro-rs").is_ok());
 
         assert!(validate_image_ref("").is_err());
-        assert!(validate_image_ref("docker.io/owner/kiro-rs:latest").is_err());
-        assert!(validate_image_ref("ghcr.io/owner").is_err());
-        assert!(validate_image_ref("ghcr.io/owner/").is_err());
-        assert!(validate_image_ref("ghcr.io//kiro-rs:latest").is_err());
-        assert!(validate_image_ref("ghcr.io/owner/kiro rs:latest").is_err());
-    }
-
-    #[test]
-    fn extracts_ghcr_login_owner() {
-        assert_eq!(
-            ghcr_login_user("ghcr.io/ZyphrZero/kiro-rs:latest"),
-            "ZyphrZero"
-        );
-        assert_eq!(ghcr_login_user("ghcr.io/owner/nested/image:tag"), "owner");
-    }
-
-    #[test]
-    fn validates_compose_update_inputs() {
-        assert!(validate_compose_file("/app/config/docker-compose.yml").is_ok());
-        assert!(validate_compose_file("/app/config/docker-compose.yml\n").is_err());
-
-        assert!(validate_compose_service("kiro-rs").is_ok());
-        assert!(validate_compose_service("kiro_rs.1").is_ok());
-        assert!(validate_compose_service("").is_err());
-        assert!(validate_compose_service("kiro-rs;rm").is_err());
+        assert!(validate_image_ref("ghcr.io/owner/kiro-rs:latest").is_err());
+        assert!(validate_image_ref("docker.io/owner/").is_err());
+        assert!(validate_image_ref("docker.io//kiro-rs:latest").is_err());
+        assert!(validate_image_ref("docker.io/owner/kiro rs:latest").is_err());
+        // 单段、缺少 owner 视为非法
+        assert!(validate_image_ref("kiro-rs").is_err());
     }
 }

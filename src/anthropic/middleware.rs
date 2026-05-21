@@ -30,6 +30,10 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态
+    ///
+    /// 默认入口通过 `with_provider` 注入 `KiroProvider`；这个简化构造函数留给
+    /// 下游 lib 用户使用（e.g. 测试、嵌入到其他服务时）。
+    #[allow(dead_code)]
     pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
         Self {
             api_key: Arc::new(RwLock::new(api_key.into())),

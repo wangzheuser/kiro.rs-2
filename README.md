@@ -83,7 +83,7 @@
 
 > **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
 > ```bash
-> cd admin-ui && pnpm install && pnpm build
+> cd admin-ui && bun install && bun run build
 > ```
 
 ```bash
@@ -163,6 +163,7 @@ curl http://127.0.0.1:8990/v1/messages \
 ```bash
 mkdir -p /opt/kiro-rs/data
 cd /opt/kiro-rs
+# 把仓库的 docker-compose.yml 放到这里即可
 ```
 
 宿主机使用 `data/` 目录保存运行配置和凭据，容器内仍挂载为 `/app/config`。这样可以避免宿主机目录名 `config/` 和文件名 `config.json` 重复造成混淆：
@@ -170,36 +171,7 @@ cd /opt/kiro-rs
 ```text
 /opt/kiro-rs/
 ├── docker-compose.yml
-└── data/
-    ├── config.json
-    └── credentials.json
-```
-
-`data/config.json` 的容器部署示例：
-
-```json
-{
-   "host": "0.0.0.0",
-   "port": 8990,
-   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-   "adminApiKey": "sk-admin-your-secret-key",
-   "region": "us-east-1",
-   "tlsBackend": "rustls",
-   "defaultEndpoint": "ide",
-   "githubToken": "",
-   "updateImage": "ghcr.io/zyphrzero/kiro-rs:latest",
-   "updateComposeFile": "/app/config/docker-compose.yml",
-   "updateService": "kiro-rs",
-   "redisUrl": "redis://redis:6379",
-   "cacheDebugLogging": false,
-   "cacheMaxReadRatio": [0.8, 0.95]
-}
-```
-
-先创建空凭据文件，之后可在 Admin UI 中添加凭据：
-
-```bash
-echo '[]' > data/credentials.json
+└── data/                 # 首次启动后自动生成 config.json / credentials.json
 ```
 
 `docker-compose.yml` 中的挂载关系：
@@ -217,7 +189,12 @@ volumes:
 docker compose up -d
 ```
 
-启动后访问 `http://服务器IP:8990/admin`，使用 `config.json` 中的 `adminApiKey` 登录管理页面。
+首次启动时如果 `data/config.json` 或 `data/credentials.json` 不存在，容器会自动生成：
+
+- `config.json`：监听 `0.0.0.0:8990`，并随机生成 `apiKey`（`sk-kiro-rs-...`）和 `adminApiKey`（`sk-admin-...`）。容器日志里会打印一次这两个密钥，请记下来用于客户端调用和 Admin UI 登录；之后可直接编辑 `data/config.json` 修改。
+- `credentials.json`：写入空数组 `[]`，后续通过 Admin UI 添加凭据即可。
+
+启动后访问 `http://服务器IP:8990/admin`，使用 `data/config.json` 中的 `adminApiKey` 登录管理页面。
 
 ## 配置详解
 
@@ -243,10 +220,9 @@ docker compose up -d
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `githubToken` | string | - | GitHub Token（可选），用于 GHCR 私有镜像拉取或避免 GitHub/GHCR 认证限制 |
-| `updateImage` | string | `ghcr.io/zyphrzero/kiro-rs:latest` | 在线更新使用的 GHCR 镜像 |
-| `updateComposeFile` | string | - | 在线更新使用的 Docker Compose 文件路径；容器部署通常为 `/app/config/docker-compose.yml` |
-| `updateService` | string | `kiro-rs` | 在线更新时重建的 Docker Compose service 名称 |
+| `updateImage` | string | `zyphrzero/kiro-rs:latest` | 在线更新使用的 Docker Hub 镜像，格式 `owner/image:tag` |
+| `updateAutoApply` | boolean | `false` | 是否启用无人值守自动更新；开启后每天到 `updateAutoApplyTime` 自动检查并更新 |
+| `updateAutoApplyTime` | string | `03:00` | 自动更新触发时间（本地时区，HH:MM 24 小时制） |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。可选值：`ide`（Kiro IDE）、`cli`（Amazon Q for CLI，适用于 `ksk_` 前缀的 API Key） |
@@ -273,10 +249,9 @@ docker compose up -d
    "proxyUsername": "user",
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
-   "githubToken": "<your-github-token>",
-   "updateImage": "ghcr.io/zyphrzero/kiro-rs:latest",
-   "updateComposeFile": "/app/config/docker-compose.yml",
-   "updateService": "kiro-rs",
+   "updateImage": "zyphrzero/kiro-rs:latest",
+   "updateAutoApply": false,
+   "updateAutoApplyTime": "03:00",
    "loadBalancingMode": "priority",
    "extractThinking": true
 }
@@ -524,11 +499,13 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ### 在线更新镜像
 
-Admin UI 顶部的“镜像在线更新”入口支持：
+Admin UI 顶部的「镜像在线更新」入口支持：
 
-- 保存 GHCR 镜像地址和 GitHub Token（Token 不会在接口中回显明文）
-- 执行 `docker pull <updateImage>` 拉取 GitHub Container Registry 镜像
-- 在配置 `updateComposeFile` 和 `updateService` 后执行 `docker compose pull/up -d` 重建服务
+- 配置 Docker Hub 镜像地址（默认 `zyphrzero/kiro-rs:latest`）
+- 一键拉取镜像并通过 docker compose 重建容器；compose 文件路径与 service 名运行时从当前容器的 docker compose 标签自动发现，无需手动配置
+- 自动备份当前镜像到本地 `kiro-rs:rollback` tag，支持「回退到上一版本」一键还原
+- 可开启「无人值守自动更新」：每天到指定时间检查并应用新版本
+- 自动检查 Docker Hub 新版本，发现新 tag 时在工具栏图标上显示红点提醒
 
 容器部署时需要让容器能够访问宿主机 Docker daemon。默认 `docker-compose.yml` 已示例挂载：
 
@@ -539,7 +516,7 @@ volumes:
   - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-只支持 `ghcr.io/...` 镜像。项目的 GitHub Actions 会发布到 GitHub Container Registry，不依赖 Docker Hub。
+镜像和版本号都从 Docker Hub 取（`hub.docker.com/r/<owner>/kiro-rs`），项目 GitHub Actions 在每次发布时会自动推送到 Docker Hub。
 
 ## 发布流程
 
@@ -554,12 +531,14 @@ volumes:
 
 - 校验 tag/input 版本和 `Cargo.toml` 一致，避免 tag、二进制和镜像版本错位
 - 构建 Windows、Linux、macOS 多平台二进制并打包
-- 发布 GHCR 多架构镜像：
-  - `ghcr.io/zyphrzero/kiro-rs:<version>`
-  - `ghcr.io/zyphrzero/kiro-rs:latest`
+- 发布 Docker Hub 多架构镜像：
+  - `zyphrzero/kiro-rs:<version>`
+  - `zyphrzero/kiro-rs:latest`
 - 创建 GitHub Release，并上传二进制包和 `SHA256SUMS.txt`
 
-`Build Artifacts` 和 `Build and Push GHCR Images` workflow 仍会在 `master` push 上生成 beta 构建，也可以手动输入版本号运行；正式发布入口以 `Release` workflow 为准，避免重复构建和重复推送镜像。`master` 的 beta 镜像只更新 `beta` 标签，不会覆盖 `latest`。
+`Build Artifacts` 和 `Build and Push Docker Hub Images` workflow 仍会在 `master` push 上生成 beta 构建，也可以手动输入版本号运行；正式发布入口以 `Release` workflow 为准，避免重复构建和重复推送镜像。`master` 的 beta 镜像只更新 `beta` 标签，不会覆盖 `latest`。
+
+> 第一次切到 Docker Hub 发布前，先在仓库 Settings → Secrets and variables → Actions 添加 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`（Docker Hub Access Token）。
 
 ## 注意事项
 

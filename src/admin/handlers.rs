@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
@@ -446,6 +446,26 @@ pub async fn apply_image_update(State(state): State<AdminState>) -> impl IntoRes
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// POST /api/admin/system/update/rollback
+/// 回退到上一次更新前的镜像版本（使用本地备份 tag，无需联网）
+pub async fn rollback_image_update(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.rollback_image_update() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/system/update/check?force=true
+/// 查询 GitHub Releases 是否有新版本（带 30 分钟缓存）
+pub async fn check_update(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let force = matches!(params.get("force").map(String::as_str), Some("true" | "1"));
+    let info = state.service.check_update(force).await;
+    Json(info).into_response()
 }
 
 /// POST /api/admin/credentials/:id/relogin/social/start

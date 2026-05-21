@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Server, Lock } from 'lucide-react'
+import { Lock } from 'lucide-react'
 import { storage } from '@/lib/storage'
 import { getCredentials } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -43,9 +43,12 @@ export function LoginPage({ onLogin }: LoginPageProps) {
       <div className="w-full max-w-[400px] animate-fade-in">
         <div className="rounded-2xl border border-border/60 bg-card/80 backdrop-blur-2xl backdrop-saturate-150 shadow-apple-lg p-8">
           <div className="flex flex-col items-center text-center mb-7">
-            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-primary to-primary/70 shadow-apple">
-              <Server className="h-7 w-7 text-primary-foreground" />
-            </div>
+            <img
+              src="/admin/kirors.png"
+              alt="Kiro"
+              className="mb-4 h-20 w-20 object-contain"
+              draggable={false}
+            />
             <h1 className="text-[22px] font-semibold tracking-tight">Kiro Admin</h1>
             <p className="mt-1 text-sm text-muted-foreground">
               使用 Admin API Key 登录管理面板

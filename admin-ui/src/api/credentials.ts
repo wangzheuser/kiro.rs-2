@@ -28,6 +28,7 @@ import type {
   UpdateConfigResponse,
   SetUpdateConfigRequest,
   ImageUpdateResponse,
+  UpdateCheckInfo,
   UpdateAdminKeyRequest,
 } from '@/types/api'
 
@@ -273,6 +274,20 @@ export async function pullUpdateImage(): Promise<ImageUpdateResponse> {
 // 拉取镜像并通过 Docker Compose 应用更新
 export async function applyImageUpdate(): Promise<ImageUpdateResponse> {
   const { data } = await api.post<ImageUpdateResponse>('/system/update/apply')
+  return data
+}
+
+// 通过本地备份 tag 回退到上一次更新前的镜像版本
+export async function rollbackImageUpdate(): Promise<ImageUpdateResponse> {
+  const { data } = await api.post<ImageUpdateResponse>('/system/update/rollback')
+  return data
+}
+
+// 检查 GitHub Releases 是否有新版本（带后端 30 分钟缓存；force=true 强制刷新）
+export async function checkSystemUpdate(force = false): Promise<UpdateCheckInfo> {
+  const { data } = await api.get<UpdateCheckInfo>('/system/update/check', {
+    params: force ? { force: 'true' } : undefined,
+  })
   return data
 }
 

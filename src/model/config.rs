@@ -94,21 +94,24 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// GitHub Token（可选，用于 GHCR 私有镜像拉取和规避 GitHub API 限流）
-    #[serde(default)]
-    pub github_token: Option<String>,
-
-    /// 在线更新使用的容器镜像（默认使用 GitHub Container Registry）
+    /// 在线更新使用的容器镜像（默认使用 Docker Hub 公开镜像）
     #[serde(default = "default_update_image")]
     pub update_image: String,
 
-    /// 在线更新使用的 docker compose 文件路径（容器内需要挂载 Docker socket 和 compose 文件）
+    /// 上一次成功更新前正在运行的镜像引用，用于在前端展示「回退到 …」
+    /// （回退命令始终通过 `kiro-rs:rollback` 这个本地备份 tag 完成）。
     #[serde(default)]
-    pub update_compose_file: Option<String>,
+    pub update_previous_image: Option<String>,
 
-    /// 在线更新重建的 docker compose service 名称
-    #[serde(default = "default_update_service")]
-    pub update_service: String,
+    /// 是否启用无人值守自动更新。开启后服务会在每天的 `update_auto_apply_time`
+    /// 时刻检查 GitHub Releases，发现新版本即自动调用 `apply_image_update` 重建容器。
+    #[serde(default)]
+    pub update_auto_apply: bool,
+
+    /// 自动更新的每日触发时间（本地时区，`HH:MM` 24 小时制）。
+    /// 默认 03:00 凌晨执行，对在线服务影响最小。
+    #[serde(default = "default_update_auto_apply_time")]
+    pub update_auto_apply_time: String,
 
     /// Redis 连接 URL（可选，启用缓存功能）
     #[serde(default)]
@@ -187,11 +190,11 @@ fn default_load_balancing_mode() -> String {
 }
 
 fn default_update_image() -> String {
-    "ghcr.io/zyphrzero/kiro-rs:latest".to_string()
+    "zyphrzero/kiro-rs:latest".to_string()
 }
 
-fn default_update_service() -> String {
-    "kiro-rs".to_string()
+fn default_update_auto_apply_time() -> String {
+    "03:00".to_string()
 }
 
 fn default_cache_max_read_ratio() -> CacheMaxReadRatio {
@@ -227,10 +230,10 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
-            github_token: None,
             update_image: default_update_image(),
-            update_compose_file: None,
-            update_service: default_update_service(),
+            update_previous_image: None,
+            update_auto_apply: false,
+            update_auto_apply_time: default_update_auto_apply_time(),
             redis_url: None,
             cache_debug_logging: false,
             cache_max_read_ratio: default_cache_max_read_ratio(),
@@ -274,6 +277,17 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
+
+        // 用户手工把字符串字段清空（如 `"updateImage": ""`）时，serde 默认值不会
+        // 介入；这里把"看起来像空"的关键字段回退到默认值，避免后续业务用到
+        // 空字符串导致难以诊断的错误。
+        if config.update_image.trim().is_empty() {
+            config.update_image = default_update_image();
+        }
+        if config.update_auto_apply_time.trim().is_empty() {
+            config.update_auto_apply_time = default_update_auto_apply_time();
+        }
+
         Ok(config)
     }
 

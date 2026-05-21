@@ -21,6 +21,10 @@ use super::{
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
+///
+/// 当前默认入口走 [`create_router_with_shared_key`]，本函数是给嵌入到其他 Rust
+/// 项目的下游使用者预留的扩展点，因此可能在 lib 内部不被引用。
+#[allow(dead_code)]
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,

@@ -169,16 +169,18 @@ export interface SetGlobalProxyRequest {
 // 镜像在线更新配置
 export interface UpdateConfigResponse {
   image: string
-  composeFile?: string
-  service: string
-  githubTokenConfigured: boolean
+  /** 上一次更新前正在运行的镜像引用；存在时可调用回退接口 */
+  previousImage?: string
+  /** 是否开启无人值守自动更新 */
+  autoApply: boolean
+  /** 自动更新触发时间（本地时区，HH:MM 24 小时制） */
+  autoApplyTime: string
 }
 
 export interface SetUpdateConfigRequest {
   image?: string
-  composeFile?: string
-  service?: string
-  githubToken?: string
+  autoApply?: boolean
+  autoApplyTime?: string
 }
 
 export interface ImageUpdateResponse {
@@ -188,6 +190,20 @@ export interface ImageUpdateResponse {
   output?: string
   applied: boolean
   needRestart: boolean
+}
+
+export interface UpdateCheckInfo {
+  currentVersion: string
+  latestVersion: string
+  hasUpdate: boolean
+  buildType: string
+  releaseName?: string
+  releaseNotes?: string
+  releaseUrl?: string
+  publishedAt?: string
+  checkedAt: string
+  cached: boolean
+  warning?: string
 }
 
 // Admin Key 修改

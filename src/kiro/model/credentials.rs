@@ -16,7 +16,10 @@ pub const SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 
 /// Kiro OAuth 凭证
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// `Debug` 输出经过脱敏处理：access_token / refresh_token / client_secret /
+/// kiro_api_key / proxy_password 等敏感字段只显示长度，不会泄露明文。
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroCredentials {
     /// 凭据唯一标识符（自增 ID）
@@ -123,6 +126,45 @@ pub struct KiroCredentials {
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+/// 仅显示长度，不暴露明文。例如 `Some(42 chars)` 或 `None`。
+fn fmt_redacted(value: &Option<String>) -> String {
+    match value {
+        Some(s) if !s.is_empty() => format!("Some({} chars)", s.chars().count()),
+        Some(_) => "Some(<empty>)".to_string(),
+        None => "None".to_string(),
+    }
+}
+
+impl std::fmt::Debug for KiroCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 单独脱敏所有可能含密钥/Token 的字段，其他元数据正常打印
+        f.debug_struct("KiroCredentials")
+            .field("id", &self.id)
+            .field("access_token", &fmt_redacted(&self.access_token))
+            .field("refresh_token", &fmt_redacted(&self.refresh_token))
+            .field("profile_arn", &self.profile_arn)
+            .field("expires_at", &self.expires_at)
+            .field("auth_method", &self.auth_method)
+            .field("provider", &self.provider)
+            .field("client_id", &fmt_redacted(&self.client_id))
+            .field("client_secret", &fmt_redacted(&self.client_secret))
+            .field("priority", &self.priority)
+            .field("region", &self.region)
+            .field("auth_region", &self.auth_region)
+            .field("api_region", &self.api_region)
+            .field("machine_id", &fmt_redacted(&self.machine_id))
+            .field("email", &self.email)
+            .field("subscription_title", &self.subscription_title)
+            .field("proxy_url", &self.proxy_url)
+            .field("proxy_username", &self.proxy_username)
+            .field("proxy_password", &fmt_redacted(&self.proxy_password))
+            .field("disabled", &self.disabled)
+            .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 fn canonicalize_auth_method_value(value: &str) -> &str {

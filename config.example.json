@@ -6,10 +6,9 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
-  "githubToken": "",
-  "updateImage": "ghcr.io/zyphrzero/kiro-rs:latest",
-  "updateComposeFile": "/app/config/docker-compose.yml",
-  "updateService": "kiro-rs",
+  "updateImage": "zyphrzero/kiro-rs:latest",
+  "updateAutoApply": false,
+  "updateAutoApplyTime": "03:00",
   "redisUrl": "redis://redis:6379",
   "cacheDebugLogging": false,
   "cacheMaxReadRatio": [0.8, 0.95]

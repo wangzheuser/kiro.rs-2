@@ -32,6 +32,8 @@ import {
   useCredentials, useDeleteCredential, useResetFailure,
   useLoadBalancingMode, useSetLoadBalancingMode, useResetAllSuccessCount,
 } from '@/hooks/use-credentials'
+import { useUpdateCheck } from '@/hooks/use-update-check'
+import { useRectSelect } from '@/hooks/use-rect-select'
 import { getCredentialBalance, forceRefreshToken, updateAdminKey, disableQuotaExceeded, updateApiKey, enableOverageForAllCapable } from '@/api/credentials'
 import { extractErrorMessage, parseError, generateApiKey } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -82,11 +84,30 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const resetAllSuccess = useResetAllSuccessCount()
+  const { data: updateCheck } = useUpdateCheck()
 
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
+  const currentPageIds = currentCredentials.map((c) => c.id)
+  const currentPageAllSelected =
+    currentPageIds.length > 0 && currentPageIds.every((id) => selectedIds.has(id))
+  const gridRef = useRef<HTMLElement | null>(null)
+  const rectSelection = useRectSelect({
+    containerRef: gridRef,
+    itemSelector: '[data-credential-id]',
+    idAttribute: 'credential-id',
+    enabled: currentCredentials.length > 0,
+    onSelectionChange: (hits, additive) => {
+      setSelectedIds((prev) => {
+        if (!additive) return new Set(hits)
+        const next = new Set(prev)
+        hits.forEach((id) => next.add(id))
+        return next
+      })
+    },
+  })
   const disabledCredentialCount = data?.credentials.filter(c => c.disabled).length || 0
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const c = data?.credentials.find(x => x.id === id)
@@ -180,6 +201,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setSelectedIds(next)
   }
   const deselectAll = () => setSelectedIds(new Set())
+
+  /** 全选 / 取消全选当前页凭据。已选中其他页的不会被清除。 */
+  const toggleSelectCurrentPage = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (currentPageAllSelected) {
+        currentPageIds.forEach((id) => next.delete(id))
+      } else {
+        currentPageIds.forEach((id) => next.add(id))
+      }
+      return next
+    })
+  }
 
   const handleBatchDelete = async () => {
     if (selectedIds.size === 0) { toast.error('请先选择要删除的凭据'); return }
@@ -448,11 +482,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
     <div className="min-h-screen">
       {/* 顶部毛玻璃导航条 */}
       <header className="sticky top-0 z-40 w-full glass">
-        <div className="mx-auto max-w-[1400px] flex h-14 items-center justify-between px-4 md:px-8">
+        <div className="mx-auto max-w-[1400px] flex h-16 items-center justify-between px-4 md:px-8">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-primary/70 shadow-apple-sm">
-              <Server className="h-4 w-4 text-primary-foreground" />
-            </div>
+            <img
+              src="/admin/kirors.png"
+              alt="Kiro"
+              className="h-10 w-10 object-contain"
+              draggable={false}
+            />
             <span className="font-semibold tracking-tight">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-1.5">
@@ -472,8 +509,24 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={handleRefresh} title="刷新">
               <RefreshCw className="h-4 w-4" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={() => setImageUpdateDialogOpen(true)} title="镜像在线更新">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setImageUpdateDialogOpen(true)}
+              title={
+                updateCheck?.hasUpdate
+                  ? `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
+                  : '镜像在线更新'
+              }
+              className="relative"
+            >
               <UploadCloud className="h-4 w-4" />
+              {updateCheck?.hasUpdate && (
+                <span className="absolute right-1 top-1 inline-flex h-2 w-2 items-center justify-center">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
+                </span>
+              )}
             </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -513,7 +566,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       {/* 主内容 */}
-      <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
+      <main ref={gridRef} className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
         {/* 大标题区 */}
         <div className="mb-6 flex items-end justify-between gap-4">
           <div>
@@ -559,6 +612,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
             {data?.credentials && data.credentials.length > 0 && (
               <Badge variant="secondary">{data.credentials.length}</Badge>
+            )}
+            {currentCredentials.length > 0 && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={toggleSelectCurrentPage}
+                title={currentPageAllSelected ? '取消选择当前页' : '全选当前页'}
+              >
+                {currentPageAllSelected ? '取消全选' : '全选当前页'}
+              </Button>
             )}
             {selectedIds.size > 0 && (
               <>
@@ -711,7 +774,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         ) : (
           <>
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 select-none">
               {currentCredentials.map((credential) => (
                 <CredentialCard
                   key={credential.id}
@@ -769,6 +832,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <KamImportDialog open={kamImportDialogOpen} onOpenChange={setKamImportDialogOpen} />
       <ProxyPoolDialog open={proxyPoolDialogOpen} onOpenChange={setProxyPoolDialogOpen} />
       <ImageUpdateDialog open={imageUpdateDialogOpen} onOpenChange={setImageUpdateDialogOpen} />
+
+      {rectSelection.active && rectSelection.rect && (
+        <div
+          className="pointer-events-none fixed z-50 rounded-sm border border-primary/70 bg-primary/15"
+          style={{
+            left: rectSelection.rect.left,
+            top: rectSelection.rect.top,
+            width: rectSelection.rect.width,
+            height: rectSelection.rect.height,
+          }}
+        />
+      )}
       <BatchVerifyDialog
         open={verifyDialogOpen}
         onOpenChange={setVerifyDialogOpen}

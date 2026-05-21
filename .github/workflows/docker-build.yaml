@@ -1,4 +1,4 @@
-name: Build and Push GHCR Images
+name: Build and Push Docker Hub Images
 
 on:
   push:
@@ -13,10 +13,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
-
-env:
-  OWNER_LC: ${{ github.repository_owner }}
 
 jobs:
   pre-check:
@@ -28,7 +24,7 @@ jobs:
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
           fetch-depth: 0
-      - name: Check if commit has release tag
+      - name: Skip build when commit already has release tag
         id: check
         run: |
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
@@ -45,6 +41,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       is_beta: ${{ steps.version.outputs.is_beta }}
+      image: ${{ steps.repo.outputs.image }}
 
     strategy:
       fail-fast: false
@@ -61,9 +58,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Lowercase owner
-        id: owner
-        run: echo "name=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+      - name: Resolve Docker Hub repo
+        id: repo
+        run: |
+          NAMESPACE="${{ secrets.DOCKERHUB_USERNAME }}"
+          if [ -z "$NAMESPACE" ]; then
+            NAMESPACE="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          fi
+          echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
 
       - name: Determine version
         id: version
@@ -81,12 +83,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -97,7 +99,7 @@ jobs:
           cache-to: type=gha,mode=max
           push: true
           provenance: false
-          tags: ghcr.io/${{ steps.owner.outputs.name }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+          tags: ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
@@ -106,30 +108,25 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Lowercase owner
-        id: owner
-        run: echo "name=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
-
-      - name: Log in to GitHub Container Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Create and push multi-arch manifest
         run: |
+          set -euo pipefail
           VERSION="${{ needs.build.outputs.version }}"
           IS_BETA="${{ needs.build.outputs.is_beta }}"
-          IMAGE="ghcr.io/${{ steps.owner.outputs.name }}/kiro-rs"
+          IMAGE="${{ needs.build.outputs.image }}"
 
-          # Create manifest for version tag
           docker manifest create ${IMAGE}:${VERSION} \
             ${IMAGE}:${VERSION}-amd64 \
             ${IMAGE}:${VERSION}-arm64
           docker manifest push ${IMAGE}:${VERSION}
 
-          # Stable/manual builds update latest.
           if [ "${IS_BETA}" != "true" ]; then
             docker manifest create ${IMAGE}:latest \
               ${IMAGE}:${VERSION}-amd64 \
@@ -137,7 +134,6 @@ jobs:
             docker manifest push ${IMAGE}:latest
           fi
 
-          # Beta branch builds only update the beta alias.
           if [ "${IS_BETA}" = "true" ]; then
             docker manifest create ${IMAGE}:beta \
               ${IMAGE}:${VERSION}-amd64 \

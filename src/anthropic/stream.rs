@@ -1212,6 +1212,10 @@ pub struct BufferedStreamContext {
 
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
+    ///
+    /// 当前主流程使用 `from_stream_context` 直接复用既有上下文，本构造函数
+    /// 留给以后切换到独立缓冲流场景使用。
+    #[allow(dead_code)]
     pub fn new(
         model: impl Into<String>,
         estimated_input_tokens: i32,

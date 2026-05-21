@@ -31,19 +31,24 @@ async fn main() {
         )
         .init();
 
-    // 加载配置
+    // 解析配置/凭证路径
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
+    let credentials_path = args
+        .credentials
+        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+
+    // 文件不存在时自动初始化（Docker 首次部署友好）
+    ensure_config_files(&config_path, &credentials_path);
+
+    // 加载配置
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
 
     // 加载凭证（支持单对象或数组格式）
-    let credentials_path = args
-        .credentials
-        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);
@@ -73,9 +78,16 @@ async fn main() {
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
-    // 获取第一个凭据用于日志显示
+    // 仅显示安全的元数据，避免在日志里泄露 token / client_secret
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    tracing::debug!(
+        id = ?first_credentials.id,
+        email = ?first_credentials.email,
+        auth_method = ?first_credentials.auth_method,
+        priority = first_credentials.priority,
+        endpoint = ?first_credentials.endpoint,
+        "已选定主凭证"
+    );
 
     // 获取 API Key
     let api_key = config.api_key.clone().unwrap_or_else(|| {
@@ -201,6 +213,10 @@ async fn main() {
                 .service
                 .start_balance_refresher(std::time::Duration::from_secs(300));
 
+            // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
+            // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
+            admin_state.service.start_auto_update_scheduler();
+
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -237,4 +253,75 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// 文件不存在时初始化配置/凭证文件
+///
+/// - `config.json`：写入带随机 `apiKey` / `adminApiKey` 的最小默认配置，
+///   `host` 设为 `0.0.0.0` 以适配容器场景，端口/默认端点等其余字段沿用代码默认值。
+/// - `credentials.json`：写入空数组 `[]`，便于后续通过 Admin UI 添加凭据。
+///
+/// 任一步失败都仅打印警告，不中断启动；后续 `Config::load` / `CredentialsConfig::load`
+/// 仍会按既有逻辑处理（失败再退出）。
+fn ensure_config_files(config_path: &str, credentials_path: &str) {
+    let config_p = std::path::Path::new(config_path);
+    if !config_p.exists() {
+        if let Some(parent) = config_p.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!("创建配置目录失败 {}: {}", parent.display(), e);
+                }
+            }
+        }
+        let api_key = format!("sk-kiro-rs-{}", random_token(24));
+        let admin_api_key = format!("sk-admin-{}", random_token(24));
+        let default = serde_json::json!({
+            "host": "0.0.0.0",
+            "port": 8990,
+            "apiKey": api_key,
+            "adminApiKey": admin_api_key,
+            "region": "us-east-1",
+            "tlsBackend": "rustls",
+            "defaultEndpoint": "ide"
+        });
+        match serde_json::to_string_pretty(&default)
+            .map_err(anyhow::Error::from)
+            .and_then(|s| std::fs::write(config_p, s).map_err(anyhow::Error::from))
+        {
+            Ok(_) => {
+                tracing::info!("已生成默认配置: {}", config_p.display());
+                tracing::info!("  apiKey      = {}", api_key);
+                tracing::info!("  adminApiKey = {}", admin_api_key);
+                tracing::info!("请妥善保存上述密钥，可在配置文件中修改");
+            }
+            Err(e) => tracing::warn!("写入默认配置失败 {}: {}", config_p.display(), e),
+        }
+    }
+
+    let cred_p = std::path::Path::new(credentials_path);
+    if !cred_p.exists() {
+        if let Some(parent) = cred_p.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!("创建凭证目录失败 {}: {}", parent.display(), e);
+                }
+            }
+        }
+        if let Err(e) = std::fs::write(cred_p, "[]\n") {
+            tracing::warn!("写入空凭证文件失败 {}: {}", cred_p.display(), e);
+        } else {
+            tracing::info!("已生成空凭证文件: {}（可通过 Admin UI 添加凭据）", cred_p.display());
+        }
+    }
+}
+
+/// 生成一段长度为 `len` 的字母数字随机字符串，用于默认 API Key
+fn random_token(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    (0..len)
+        .map(|_| {
+            let idx = fastrand::usize(..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
 }
