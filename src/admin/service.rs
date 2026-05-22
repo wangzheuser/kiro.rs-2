@@ -845,7 +845,7 @@ impl AdminService {
         let exe = super::binary_update::current_executable()?;
         let staged = staged_binary_path(&exe);
 
-        let version = self.resolve_target_version().await?;
+        let version = self.resolve_target_version(false).await?;
         super::binary_update::download_release_binary(&version, proxy.as_deref(), &staged).await?;
 
         Ok(ImageUpdateResponse {
@@ -868,7 +868,7 @@ impl AdminService {
         let exe = super::binary_update::current_executable()?;
         let staged = staged_binary_path(&exe);
 
-        let version = self.resolve_target_version().await?;
+        let version = self.resolve_target_version(true).await?;
         super::binary_update::download_release_binary(&version, proxy.as_deref(), &staged).await?;
 
         // 记录当前版本作为「上一版本」，供前端展示「回退」按钮
@@ -952,7 +952,15 @@ impl AdminService {
 
     /// 返回 GitHub Releases 上的最新可用版本号（无 `v` 前缀）。
     /// 失败时返回 `InternalError`，调用方应直接返回给前端。
-    async fn resolve_target_version(&self) -> Result<String, AdminServiceError> {
+    /// 返回 GitHub Releases 上的最新可用版本号（无 `v` 前缀）。
+    /// 失败时返回 `InternalError`，调用方应直接返回给前端。
+    ///
+    /// `require_update` 为 true 时，若当前版本已经是最新（无更新可用），
+    /// 直接返回错误而不是返回相同版本号——避免 apply 流程下载并替换同一版本。
+    async fn resolve_target_version(
+        &self,
+        require_update: bool,
+    ) -> Result<String, AdminServiceError> {
         let info = self.check_update(true).await;
         if let Some(warn) = info.warning {
             return Err(AdminServiceError::InternalError(warn));
@@ -961,6 +969,12 @@ impl AdminService {
             return Err(AdminServiceError::InternalError(
                 "无法解析最新版本号（GitHub Releases 返回空）".to_string(),
             ));
+        }
+        if require_update && !info.has_update {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "当前已是最新版本 v{}，无需更新",
+                info.current_version
+            )));
         }
         Ok(info.latest_version)
     }

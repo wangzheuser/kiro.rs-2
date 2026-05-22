@@ -401,8 +401,15 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
           </div>
           <Button
             type="button"
-            disabled={busy}
+            disabled={busy || !updateCheck?.hasUpdate}
             onClick={() => applyMutation.mutate()}
+            title={
+              updateCheck?.hasUpdate
+                ? `更新到 v${updateCheck.latestVersion} 并重启`
+                : updateCheck?.currentVersion
+                  ? `当前已是最新版本 v${updateCheck.currentVersion}`
+                  : '正在检查更新…'
+            }
           >
             {applyMutation.isPending ? (
               <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
