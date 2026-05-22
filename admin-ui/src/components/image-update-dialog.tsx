@@ -694,11 +694,6 @@ function RateLimitSummary({ info, loading, onRefresh }: RateLimitSummaryProps) {
           <div className="mt-1.5 text-muted-foreground">
             重置于：<span className="font-mono">{resetText}</span>
           </div>
-          {info.scopes && (
-            <div className="mt-0.5 text-muted-foreground">
-              Scopes：<span className="font-mono">{info.scopes}</span>
-            </div>
-          )}
         </>
       ) : (
         <div className="mt-1.5 text-destructive">{info.warning || 'Token 验证失败'}</div>

@@ -1231,7 +1231,6 @@ impl AdminService {
                     used: 0,
                     reset: 0,
                     login: None,
-                    scopes: None,
                     warning: Some(format!("构造 HTTP 客户端失败: {}", e)),
                 };
             }
@@ -1258,22 +1257,12 @@ impl AdminService {
                     used: 0,
                     reset: 0,
                     login: None,
-                    scopes: None,
                     warning: Some(format!("请求 GitHub API 失败: {}", e)),
                 };
             }
         };
 
         let status = resp.status();
-        // X-OAuth-Scopes 在 token 有效且授权了 OAuth scope 时返回；个人 fine-grained
-        // token 不会有这个 header，留空即可
-        let scopes = resp
-            .headers()
-            .get("X-OAuth-Scopes")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(String::from);
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return GitHubRateLimitInfo {
@@ -1284,7 +1273,6 @@ impl AdminService {
                 used: 0,
                 reset: 0,
                 login: None,
-                scopes: None,
                 warning: Some("GitHub Token 无效或已过期".to_string()),
             };
         }
@@ -1298,7 +1286,6 @@ impl AdminService {
                 used: 0,
                 reset: 0,
                 login: None,
-                scopes: None,
                 warning: Some(format!(
                     "GitHub API 返回 {}: {}",
                     status,
@@ -1318,7 +1305,6 @@ impl AdminService {
                     used: 0,
                     reset: 0,
                     login: None,
-                    scopes,
                     warning: Some(format!("解析 GitHub 响应失败: {}", e)),
                 };
             }
@@ -1353,7 +1339,6 @@ impl AdminService {
             used,
             reset,
             login,
-            scopes,
             warning: None,
         }
     }

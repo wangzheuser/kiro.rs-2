@@ -429,9 +429,6 @@ pub struct GitHubRateLimitInfo {
     /// token 对应的用户名（仅 token 有效且属于个人时返回）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub login: Option<String>,
-    /// token 授予的权限范围（X-OAuth-Scopes header）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scopes: Option<String>,
     /// 失败时的提示信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,

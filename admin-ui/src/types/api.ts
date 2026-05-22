@@ -203,8 +203,6 @@ export interface GitHubRateLimitInfo {
   reset: number
   /** token 对应的用户名（可能为空） */
   login?: string
-  /** token 授予的 OAuth scopes（可能为空） */
-  scopes?: string
   /** 失败时的提示信息 */
   warning?: string
 }
